@@ -1,10 +1,10 @@
-import os
 import json
 from datetime import datetime
 from pathlib import Path
-import anthropic
+import anyio
 from rich.console import Console
-from tracker import get_progress, update_progress, get_all_tasks_flat
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock
+from tracker import get_progress, update_progress
 
 console = Console()
 
@@ -58,12 +58,12 @@ SYSTEM_PROMPT = """You are a sharp, no-nonsense freelance strategy coach for a s
 
 ## INCOME MODEL (target: ₹1,90,000/month)
 
-| Stream | Rate | Hours | Monthly |
-|--------|------|-------|---------|
-| Retainer Client A (Cloud Cost) | ₹60,000/mo | 12 hrs/wk | ₹60,000 |
-| Retainer Client B (ES/Search) | ₹60,000/mo | 12 hrs/wk | ₹60,000 |
-| Project Client (one-off) | ₹70,000 fixed | 3–4 weeks | ₹70,000 |
-| **Total** | | | **₹1,90,000** |
+| Stream | Rate | Monthly |
+|--------|------|---------|
+| Retainer Client A (Cloud Cost) | ₹60,000/mo | ₹60,000 |
+| Retainer Client B (ES/Search) | ₹60,000/mo | ₹60,000 |
+| Project Client (one-off) | ₹70,000 fixed | ₹70,000 |
+| **Total** | | **₹1,90,000** |
 
 **Rules:**
 - Never charge below $35/hr (≈₹2,900/hr) — signals low value
@@ -192,7 +192,7 @@ If you're spending $15k+/month on cloud and haven't done a proper audit, DM me �
 ## 30-DAY EXECUTION PLAN
 
 **Week 1 — Foundation:**
-- Create Upwork profile (Cloud Cost headline, 40$/hr min)
+- Create Upwork profile (Cloud Cost headline, $40/hr min)
 - Upload portfolio samples (GitHub links, case study PDFs)
 - Identify 10 target companies on LinkedIn
 - Send 5 LinkedIn connection requests with personalized notes
@@ -208,7 +208,7 @@ If you're spending $15k+/month on cloud and haven't done a proper audit, DM me �
 
 **Week 3 — First Client:**
 - Submit 4 proposals (mix niches)
-- Conduct discovery calls (SPIN questions: Situation, Problem, Implication, Need-payoff)
+- Conduct discovery calls (SPIN questions)
 - Register on Arc.dev
 - Follow up all pending proposals > 5 days old
 - Close first paid engagement
@@ -231,12 +231,6 @@ If you're spending $15k+/month on cloud and haven't done a proper audit, DM me �
 | Arc.dev | Secondary | Month 2+ | $60–90/hr |
 | Toptal | Premium | Month 3+ | $70–100/hr |
 
-**Upwork tactics:**
-- Niche headline beats generic — "Cloud Cost Optimization for K8s Teams" > "Full Stack Developer"
-- 4 proposals/day max — quality beats volume
-- First proposal response rate <10%? Rewrite headline and opening line
-- Fixed-price projects first to build reviews, then transition to hourly
-
 ---
 
 ## INCOME TIMELINE PROJECTION
@@ -254,251 +248,63 @@ If you're spending $15k+/month on cloud and haven't done a proper audit, DM me �
 
 ## YOUR ROLE AS COACH
 
-You help execute this strategy by:
-
-1. **Generating content on demand:** Upwork proposals (customized to job posts), LinkedIn posts, cold DMs, follow-up messages, SOW drafts, discovery call scripts
-2. **Tracking progress:** Reading and updating the 30-day task tracker
-3. **Calculating income scenarios:** Given client mix, project out monthly income
-4. **Answering strategy questions:** Rate negotiation, niche selection, how to respond to client objections
-5. **Reviewing drafts:** The user pastes a proposal or DM — you improve it with specific edits
+You help the user execute this strategy by:
+1. **Generating content:** Upwork proposals (customized to job posts), LinkedIn posts, cold DMs, follow-up messages, SOW drafts, discovery call scripts
+2. **Answering strategy questions:** Rate negotiation, niche selection, how to respond to client objections
+3. **Reviewing drafts:** User pastes a proposal or DM — you improve it with specific edits
 
 **When generating proposals or DMs:**
-- Always ask for the job post URL or description if not provided
+- Always ask for the job post or company details if not provided
 - Customize the template — never output boilerplate verbatim
-- Include a specific number or result claim (latency reduction %, cost savings %, etc.)
+- Include a specific number or result claim (latency %, cost savings %, etc.)
 - End with a soft call-to-action, not a hard sell
-- Keep proposals under 250 words (Upwork best practice)
+- Keep Upwork proposals under 250 words
 - Keep LinkedIn DMs under 100 words
 
-**When the user asks to save content:**
-- Use the save_content tool immediately — don't ask, just save
-- Confirm with the filename after saving
-
-**When asked about progress:**
-- Use get_progress tool to fetch current state before answering
-- Show pending tasks in order, highlight overdue ones
-
-**Tone:** Direct, confident, zero fluff. You speak like a senior consultant who's done this before — not a motivational coach. Give specific advice, not generic platitudes.
+**Tone:** Direct, confident, zero fluff. Speak like a senior consultant who has done this before — not a motivational coach. Give specific advice, not generic platitudes.
 """
-
-TOOLS = [
-    {
-        "name": "save_content",
-        "description": "Save generated content (proposals, DMs, LinkedIn posts, SOWs) to a timestamped file in the outputs/ directory.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content_type": {
-                    "type": "string",
-                    "enum": ["proposal", "linkedin_post", "cold_dm", "follow_up", "sow", "other"],
-                    "description": "Type of content being saved"
-                },
-                "filename": {
-                    "type": "string",
-                    "description": "Short descriptive filename without extension, e.g. 'upwork-cloud-cost-jan15'"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The full text content to save"
-                }
-            },
-            "required": ["content_type", "filename", "content"]
-        }
-    },
-    {
-        "name": "update_progress",
-        "description": "Mark weekly tasks as completed in the 30-day tracker.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "week": {
-                    "type": "string",
-                    "enum": ["week1", "week2", "week3", "week4"],
-                    "description": "Which week's tasks to update"
-                },
-                "task_indices": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "Zero-based indices of tasks to mark complete"
-                },
-                "note": {
-                    "type": "string",
-                    "description": "Optional note to attach (e.g. client name, outcome)"
-                }
-            },
-            "required": ["week", "task_indices"]
-        }
-    },
-    {
-        "name": "get_progress",
-        "description": "Read the current weekly progress from the 30-day tracker.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "week": {
-                    "type": "string",
-                    "enum": ["week1", "week2", "week3", "week4"],
-                    "description": "Specific week to fetch. Omit to get all weeks."
-                }
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "calculate_income",
-        "description": "Project monthly income given a mix of retainers and projects.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "retainers": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "monthly_inr": {"type": "number"}
-                        },
-                        "required": ["label", "monthly_inr"]
-                    },
-                    "description": "List of active monthly retainers"
-                },
-                "projects": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "total_inr": {"type": "number"},
-                            "weeks": {"type": "number"}
-                        },
-                        "required": ["label", "total_inr", "weeks"]
-                    },
-                    "description": "One-off fixed projects (prorated to month)"
-                }
-            },
-            "required": []
-        }
-    }
-]
-
-
-def _execute_tool(name: str, inputs: dict) -> str:
-    if name == "save_content":
-        return _tool_save_content(**inputs)
-    elif name == "update_progress":
-        result = update_progress(
-            inputs["week"],
-            inputs["task_indices"],
-            inputs.get("note", "")
-        )
-        return json.dumps(result)
-    elif name == "get_progress":
-        result = get_progress(inputs.get("week"))
-        return json.dumps(result, indent=2)
-    elif name == "calculate_income":
-        return _tool_calculate_income(
-            inputs.get("retainers", []),
-            inputs.get("projects", [])
-        )
-    return json.dumps({"error": f"Unknown tool: {name}"})
-
-
-def _tool_save_content(content_type: str, filename: str, content: str) -> str:
-    Path("outputs").mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = filename.replace(" ", "_").replace("/", "-")
-    path = f"outputs/{ts}_{content_type}_{safe_name}.txt"
-    with open(path, "w") as f:
-        f.write(content)
-    return json.dumps({"saved": path, "bytes": len(content)})
-
-
-def _tool_calculate_income(retainers: list, projects: list) -> str:
-    total = 0
-    lines = []
-
-    for r in retainers:
-        total += r["monthly_inr"]
-        lines.append(f"  Retainer — {r['label']}: ₹{r['monthly_inr']:,.0f}/month")
-
-    for p in projects:
-        monthly_contribution = p["total_inr"] / max(p["weeks"] / 4, 1)
-        total += monthly_contribution
-        lines.append(
-            f"  Project — {p['label']}: ₹{p['total_inr']:,.0f} over {p['weeks']} weeks "
-            f"(≈₹{monthly_contribution:,.0f}/month)"
-        )
-
-    lines.append(f"\n  TOTAL: ₹{total:,.0f}/month")
-    gap = 200000 - total
-    if gap > 0:
-        lines.append(f"  Gap to ₹2L target: ₹{gap:,.0f}/month")
-    else:
-        lines.append(f"  ✓ Target exceeded by ₹{abs(gap):,.0f}/month")
-
-    return "\n".join(lines)
 
 
 class FreelanceStrategyBot:
     def __init__(self):
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not set. Copy .env.example to .env and add your key.")
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.messages: list[dict] = []
+        self._options = ClaudeAgentOptions(system_prompt=SYSTEM_PROMPT)
+        self._client: ClaudeSDKClient | None = None
+        self.last_response = ""
 
-    def reset(self):
-        self.messages = []
+    async def start(self) -> None:
+        self._client = ClaudeSDKClient(options=self._options)
+        await self._client.__aenter__()
 
-    def chat(self, user_input: str) -> None:
-        self.messages.append({"role": "user", "content": user_input})
+    async def stop(self) -> None:
+        if self._client:
+            await self._client.__aexit__(None, None, None)
+            self._client = None
 
-        while True:
-            with self.client.messages.stream(
-                model="claude-opus-4-7",
-                max_tokens=8192,
-                thinking={"type": "adaptive"},
-                output_config={"effort": "high"},
-                system=[
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=self.messages,
-                tools=TOOLS,
-            ) as stream:
-                printed_any_text = False
-                for text in stream.text_stream:
-                    console.print(text, end="", markup=False, highlight=False)
-                    printed_any_text = True
+    async def reset(self) -> None:
+        await self.stop()
+        await self.start()
+        self.last_response = ""
 
-                message = stream.get_final_message()
+    async def chat(self, user_input: str) -> None:
+        assert self._client is not None, "Call start() first"
+        await self._client.query(user_input)
+        parts: list[str] = []
+        async for message in self._client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        console.print(block.text, end="", markup=False, highlight=False)
+                        parts.append(block.text)
+        console.print()
+        self.last_response = "".join(parts)
 
-            if printed_any_text:
-                console.print()
-
-            self.messages.append({"role": "assistant", "content": message.content})
-
-            if message.stop_reason != "tool_use":
-                break
-
-            tool_results = []
-            for block in message.content:
-                if block.type != "tool_use":
-                    continue
-
-                console.print(
-                    f"\n[dim]⚙ {block.name}({json.dumps(block.input, ensure_ascii=False)})[/dim]"
-                )
-                result = _execute_tool(block.name, block.input)
-                console.print(f"[dim]  → {result[:120]}{'...' if len(result) > 120 else ''}[/dim]\n")
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-
-            self.messages.append({"role": "user", "content": tool_results})
+    def save_last(self, name: str = "response") -> str:
+        if not self.last_response.strip():
+            return ""
+        Path("outputs").mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = name.replace(" ", "_").replace("/", "-")
+        path = f"outputs/{ts}_{safe}.txt"
+        with open(path, "w") as f:
+            f.write(self.last_response)
+        return path
